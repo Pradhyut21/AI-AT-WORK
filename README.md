@@ -2,28 +2,38 @@
 
 > Stop searching. Start knowing.
 
-Built for **Microsoft Build AI Hackathon 2025** | Theme: **AI at Work: Productivity & Teamwork Reimagined**
+**Microsoft Build AI Hackathon 2025 | Theme: AI at Work**
 
-**Live Demo URL:** [collabflow-wheat.vercel.app](https://collabflow-wheat.vercel.app/)
-
----
-
-## What the Project Does
-
-CollabFlow is an AI-powered project intelligence platform designed to eliminate context debt and alignment gaps in distributed teams.
-
-1. **AI Meeting Analyzer**  
-   Paste any meeting transcript or standup notes. Using Google Gemini 2.5 Flash, the platform automatically extracts all action items/tasks, key decisions, and blockers, and generates a structured, Slack-ready team standup brief.
-
-2. **Manager Dashboard**  
-   Provides project leaders with live sprint progress tracking, team member status indicators, Git commit feeds, and a daily executive AI project brief grounded directly in task completion metrics and submission histories.
-
-3. **Developer Dashboard**  
-   Empowers developers with AI-generated task descriptions (complete with acceptance criteria, complexity scores, and recommended owners), personal action-item checklists, and an integrated submission tracker to log code delivery.
+## Live Demo
+https://collabflow-wheat.vercel.app/
 
 ---
 
-## Architecture Flow
+## What it does
+
+CollabFlow eliminates the biggest hidden cost in distributed teamwork —
+the hours lost every week to missed context, forgotten decisions, and
+tasks that fell through the cracks after a call. Three AI-powered layers
+fix this permanently.
+
+**AI Meeting Analyzer**
+Paste any meeting transcript. Gemini 2.5 Flash extracts every task,
+decision, and blocker in validated structured JSON using native JSON
+Schema Output Mode — then generates a complete Slack-ready standup
+brief in seconds.
+
+**Manager Dashboard**
+Live sprint progress, team member status, GitHub commit feed, and a
+daily AI brief grounded in real task and submission data — not a
+generic summary.
+
+**Developer Dashboard**
+AI-generated task descriptions, personal submission tracker, and
+individual action items so nothing falls through the cracks.
+
+---
+
+## Architecture
 
 ```
 Meeting Transcript / Team Data
@@ -79,9 +89,9 @@ uvicorn backend.server:app --reload
 
 ## Environment Variables
 
-- `GEMINI_API_KEY`: Your Google Gemini API Key (required for live AI analysis and briefs).
-- `PORT`: The port number on which the backend server will run (default is `8000`).
-- `SECRET_KEY`: Used for session authentication signing.
+- `GEMINI_API_KEY`: Your Google Gemini API Key.
+- `PORT`: Server port (default: 8000).
+- `SECRET_KEY`: Used for session authentication.
 
 ---
 
