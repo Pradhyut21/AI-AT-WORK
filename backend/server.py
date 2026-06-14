@@ -508,10 +508,13 @@ Task: {title}"""
         if not (GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO):
             return self.json({"events": [], "warning": "Set GITHUB_TOKEN, GITHUB_OWNER, and GITHUB_REPO in .env"})
         url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/events"
-        req = Request(url, headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"})
-        with urlopen(req, timeout=10) as response:
-            events = json.loads(response.read().decode())
-        return self.json({"events": events[:10]})
+        try:
+            req = Request(url, headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"})
+            with urlopen(req, timeout=10) as response:
+                events = json.loads(response.read().decode())
+            return self.json({"events": events[:10]})
+        except Exception as exc:
+            return self.json({"events": [], "warning": f"Failed to fetch GitHub feed: {str(exc)}"})
 
     def git_command(self, *commands):
         user = self.require_user()
