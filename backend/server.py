@@ -1,6 +1,6 @@
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from fastapi import FastAPI, Request as FastAPIRequest, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import hashlib
 import hmac
@@ -10,6 +10,7 @@ import secrets
 import sqlite3
 import subprocess
 import time
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,7 +27,7 @@ except Exception:
                 os.environ.setdefault(key.strip(), value.strip().strip('"'))
 
 DB_PATH = Path(os.environ.get("COLLABFLOW_DB", ROOT / "collabflow.db"))
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
@@ -51,27 +52,38 @@ def safe_git_run(command):
     )
 
 
-def anthropic_message(prompt, max_tokens=1000):
-    if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "your_key_here":
-        raise ValueError("ANTHROPIC_API_KEY not set")
+def gemini_message(prompt, response_json=False):
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "your_key_here":
+        raise ValueError("GEMINI_API_KEY not set")
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
     payload = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}],
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
     }
+    
+    if response_json:
+        payload["generationConfig"] = {
+            "responseMimeType": "application/json"
+        }
+        
     req = Request(
-        "https://api.anthropic.com/v1/messages",
+        url,
         data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
+        headers={"Content-Type": "application/json"},
+        method="POST"
     )
+    
     with urlopen(req, timeout=30) as response:
-        data = json.loads(response.read().decode())
-    return data["content"][0]["text"]
+        res_data = json.loads(response.read().decode())
+        
+    try:
+        text = res_data["candidates"][0]["content"]["parts"][0]["text"]
+        return text
+    except (KeyError, IndexError):
+        raise ValueError(f"Invalid response format from Gemini: {res_data}")
 
 
 def fallback_analysis(transcript):
@@ -211,213 +223,341 @@ def rowdict(row):
     return dict(row) if row else None
 
 
-class Handler(SimpleHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
-        super().end_headers()
+app = FastAPI(title="CollabFlow API")
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.end_headers()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path.startswith("/api/"):
-            return self.route("GET", parsed.path)
-        if parsed.path == "/":
-            self.path = "/index.html"
-        return super().do_GET()
 
-    def do_POST(self):
-        return self.route("POST", urlparse(self.path).path)
+def get_current_user(authorization: str = Header(None)):
+    if not authorization:
+        return {"id": 1, "name": "Rahul", "email": "manager@collabflow.ai", "role": "manager", "github_username": "rahul"}
+    token = authorization.replace("Bearer ", "", 1)
+    u = SESSIONS.get(token)
+    if not u:
+        return {"id": 1, "name": "Rahul", "email": "manager@collabflow.ai", "role": "manager", "github_username": "rahul"}
+    return u
 
-    def do_PATCH(self):
-        return self.route("PATCH", urlparse(self.path).path)
 
-    def body(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        return json.loads(self.rfile.read(length) or b"{}")
+@app.post("/api/auth/login")
+async def login(req: FastAPIRequest):
+    data = await req.json()
+    email = data.get("email", "")
+    password = data.get("password", "")
+    
+    with db() as conn:
+        user = conn.execute("select * from users where email=?", (email,)).fetchone()
+        
+    if not user or not verify_password(password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="invalid_credentials")
+        
+    token = secrets.token_urlsafe(32)
+    safe_user = {k: user[k] for k in ("id", "name", "email", "role", "github_username")}
+    SESSIONS[token] = safe_user
+    return {"token": token, "user": safe_user}
 
-    def json(self, payload, status=200):
-        data = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
-    def user(self):
-        auth = self.headers.get("Authorization", "")
-        token = auth.replace("Bearer ", "", 1)
-        u = SESSIONS.get(token)
-        if not u:
-            return {"id": 1, "name": "Rahul", "email": "manager@collabflow.ai", "role": "manager", "github_username": "rahul"}
-        return u
+@app.get("/api/me")
+async def get_me(user: dict = Depends(get_current_user)):
+    return {"user": user}
 
-    def require_user(self):
-        return self.user()
 
-    def route(self, method, path):
-        try:
-            if method == "POST" and path == "/api/auth/login":
-                data = self.body()
-                with db() as conn:
-                    user = conn.execute("select * from users where email=?", (data.get("email", ""),)).fetchone()
-                if not user or not verify_password(data.get("password", ""), user["password_hash"]):
-                    return self.json({"error": "invalid_credentials"}, 401)
-                token = secrets.token_urlsafe(32)
-                safe_user = {k: user[k] for k in ("id", "name", "email", "role", "github_username")}
-                SESSIONS[token] = safe_user
-                return self.json({"token": token, "user": safe_user})
-            if method == "GET" and path == "/api/me":
-                return self.json({"user": self.require_user()})
-            if path == "/api/tasks":
-                user = self.require_user()
-                if not user:
-                    return
-                if method == "GET":
-                    with db() as conn:
-                        rows = conn.execute(
-                            "select tasks.*, users.name assignee from tasks left join users on users.id=tasks.assignee_id order by updated_at desc"
-                        ).fetchall()
-                    return self.json({"tasks": [rowdict(r) for r in rows]})
-                if method == "POST":
-                    data = self.body()
-                    with db() as conn:
-                        cur = conn.execute(
-                            "insert into tasks(title,description,assignee_id,status,phase,due,source,updated_at) values(?,?,?,?,?,?,?,?)",
-                            (data["title"], data.get("description", ""), data.get("assignee_id"), data.get("status", "todo"), data.get("phase", "Building"), data.get("due", ""), "api", int(time.time())),
-                        )
-                    return self.json({"id": cur.lastrowid}, 201)
-            if method == "POST" and path == "/api/status":
-                user = self.require_user()
-                if not user:
-                    return
-                data = self.body()
-                with db() as conn:
-                    conn.execute(
-                        "insert into statuses(user_id,state,message,updated_at) values(?,?,?,?) on conflict(user_id) do update set state=excluded.state,message=excluded.message,updated_at=excluded.updated_at",
-                        (user["id"], data.get("state", "working"), data.get("message", ""), int(time.time())),
-                    )
-                return self.json({"ok": True})
-            if method == "POST" and path == "/api/phases/advance":
-                data = self.body()
-                with db() as conn:
-                    conn.execute(
-                        "insert into phase_events(phase,note,created_at) values(?,?,?)",
-                        (data.get("phase", "Testing"), data.get("note", "Phase advanced"), int(time.time())),
-                    )
-                return self.json({"ok": True})
-            if method == "GET" and path == "/api/github/feed":
-                return self.github_feed()
-            if method == "POST" and path == "/api/github/pull":
-                return self.git_command(["git", "pull", "--ff-only"])
-            if method == "POST" and path == "/api/github/push":
-                data = self.body()
-                message = data.get("message", "CollabFlow update")
-                return self.git_command(["git", "add", "."], ["git", "commit", "-m", message], ["git", "push"])
-            if method == "POST" and path == "/api/github/webhook":
-                data = self.body()
-                commits = data.get("commits", [])
-                pusher = data.get("pusher", {}).get("name", "GitHub User")
-                branch = data.get("ref", "refs/heads/main").split("/")[-1]
-                with db() as conn:
-                    for c in commits:
-                        msg = c.get("message", "webhook push commit")
-                        conn.execute(
-                            "insert into submissions(user_name,task_title,file_name,status,credits_awarded,submitted_at) values(?,?,?,?,?,?)",
-                            (pusher, f"Webhook Push: {msg}", f"branch:{branch}", "Approved", 15, int(time.time()))
-                        )
-                        conn.execute(
-                            "insert into credits(user_name,amount,reason,created_at) values(?,?,?,?)",
-                            (pusher, 15, f"Webhook Push Reward: {msg}", int(time.time()))
-                        )
-                return self.json({"status": "acknowledged", "credits_awarded": len(commits)*15})
-            if method == "GET" and path == "/api/state":
-                with db() as conn:
-                    tasks = conn.execute("select tasks.*, users.name as assignee from tasks left join users on users.id=tasks.assignee_id order by updated_at desc").fetchall()
-                    submissions = conn.execute("select * from submissions order by submitted_at desc").fetchall()
-                    credits_list = conn.execute("select * from credits order by created_at desc").fetchall()
-                    lb_rows = conn.execute("select user_name, sum(amount) as total from credits group by user_name order by total desc").fetchall()
-                    phase_row = conn.execute("select phase from phase_events order by created_at desc limit 1").fetchone()
-                    current_phase = phase_row["phase"] if phase_row else "Building"
-                    team_rows = conn.execute("select users.name, users.role, statuses.state, statuses.message, statuses.updated_at from users left join statuses on statuses.user_id=users.id").fetchall()
-                return self.json({
-                    "tasks": [rowdict(r) for r in tasks],
-                    "submissions": [rowdict(r) for r in submissions],
-                    "credits": [rowdict(r) for r in credits_list],
-                    "leaderboard": [rowdict(r) for r in lb_rows],
-                    "phase": current_phase,
-                    "team": [rowdict(r) for r in team_rows]
-                })
-            if method == "POST" and path == "/api/submissions":
-                data = self.body()
-                user_name = data.get("user_name", "Developer")
-                task_title = data.get("task_title", "Feature Update")
-                file_name = data.get("file_name", "push_update")
-                status = data.get("status", "Pending")
-                credits_awarded = int(data.get("credits_awarded", 10))
-                with db() as conn:
-                    conn.execute(
-                        "insert into submissions(user_name,task_title,file_name,status,credits_awarded,submitted_at) values(?,?,?,?,?,?)",
-                        (user_name, task_title, file_name, status, credits_awarded, int(time.time()))
-                    )
-                    if credits_awarded > 0:
-                        conn.execute(
-                            "insert into credits(user_name,amount,reason,created_at) values(?,?,?,?)",
-                            (user_name, credits_awarded, f"Submission: {task_title}", int(time.time()))
-                        )
-                return self.json({"ok": True})
-            if method == "POST" and path == "/api/submissions/update":
-                data = self.body()
-                sub_id = data.get("id")
-                status = data.get("status")
-                bonus = int(data.get("bonus", 0))
-                with db() as conn:
-                    if sub_id:
-                        conn.execute("update submissions set status=? where id=?", (status, sub_id))
-                        if bonus > 0:
-                            sub = conn.execute("select user_name, task_title from submissions where id=?", (sub_id,)).fetchone()
-                            if sub:
-                                conn.execute("update submissions set credits_awarded=credits_awarded+? where id=?", (bonus, sub_id))
-                                conn.execute(
-                                    "insert into credits(user_name,amount,reason,created_at) values(?,?,?,?)",
-                                    (sub["user_name"], bonus, f"Bonus for {sub['task_title']}", int(time.time()))
-                                )
-                return self.json({"ok": True})
-            if method == "POST" and path == "/api/credits/award":
-                data = self.body()
-                user_name = data.get("user_name")
-                amount = int(data.get("amount", 10))
-                reason = data.get("reason", "Manager Award")
-                with db() as conn:
+@app.get("/api/tasks")
+async def get_tasks(user: dict = Depends(get_current_user)):
+    with db() as conn:
+        rows = conn.execute(
+            "select tasks.*, users.name assignee from tasks left join users on users.id=tasks.assignee_id order by updated_at desc"
+        ).fetchall()
+    return {"tasks": [rowdict(r) for r in rows]}
+
+
+@app.post("/api/tasks")
+async def create_task(req: FastAPIRequest, user: dict = Depends(get_current_user)):
+    data = await req.json()
+    title = data.get("title")
+    if not title:
+        raise HTTPException(status_code=400, detail="Missing title")
+    description = data.get("description", "")
+    assignee_id = data.get("assignee_id")
+    status = data.get("status", "todo")
+    phase = data.get("phase", "Building")
+    due = data.get("due", "")
+    
+    with db() as conn:
+        cur = conn.execute(
+            "insert into tasks(title,description,assignee_id,status,phase,due,source,updated_at) values(?,?,?,?,?,?,?,?)",
+            (title, description, assignee_id, status, phase, due, "api", int(time.time())),
+        )
+        task_id = cur.lastrowid
+    return {"id": task_id}
+
+
+@app.post("/api/status")
+async def update_status(req: FastAPIRequest, user: dict = Depends(get_current_user)):
+    data = await req.json()
+    state = data.get("state", "working")
+    message = data.get("message", "")
+    
+    with db() as conn:
+        conn.execute(
+            "insert into statuses(user_id,state,message,updated_at) values(?,?,?,?) on conflict(user_id) do update set state=excluded.state,message=excluded.message,updated_at=excluded.updated_at",
+            (user["id"], state, message, int(time.time())),
+        )
+    return {"ok": True}
+
+
+@app.post("/api/phases/advance")
+async def advance_phase(req: FastAPIRequest):
+    data = await req.json()
+    phase = data.get("phase", "Testing")
+    note = data.get("note", "Phase advanced")
+    
+    with db() as conn:
+        conn.execute(
+            "insert into phase_events(phase,note,created_at) values(?,?,?)",
+            (phase, note, int(time.time())),
+        )
+    return {"ok": True}
+
+
+@app.get("/api/github/feed")
+async def get_github_feed():
+    if not (GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO):
+        return {"events": [], "warning": "Set GITHUB_TOKEN, GITHUB_OWNER, and GITHUB_REPO in .env"}
+        
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/events"
+    try:
+        req = Request(url, headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"})
+        with urlopen(req, timeout=10) as response:
+            events = json.loads(response.read().decode())
+        return {"events": events[:10]}
+    except Exception as exc:
+        return {"events": [], "warning": f"Failed to fetch GitHub feed: {str(exc)}"}
+
+
+@app.post("/api/github/pull")
+async def github_pull(user: dict = Depends(get_current_user)):
+    if user["role"] not in ("manager", "developer"):
+        raise HTTPException(status_code=403, detail="forbidden")
+        
+    proc = safe_git_run(["git", "pull", "--ff-only"])
+    outputs = [{"command": ["git", "pull", "--ff-only"], "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}]
+    if proc.returncode != 0:
+        return JSONResponse(status_code=400, content={"ok": False, "outputs": outputs})
+    return {"ok": True, "outputs": outputs}
+
+
+@app.post("/api/github/push")
+async def github_push(req: FastAPIRequest, user: dict = Depends(get_current_user)):
+    if user["role"] not in ("manager", "developer"):
+        raise HTTPException(status_code=403, detail="forbidden")
+        
+    data = await req.json()
+    message = data.get("message", "CollabFlow update")
+    
+    outputs = []
+    for cmd in (["git", "add", "."], ["git", "commit", "-m", message], ["git", "push"]):
+        proc = safe_git_run(cmd)
+        outputs.append({"command": cmd, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr})
+        if proc.returncode != 0 and cmd[1] != "commit":
+            return JSONResponse(status_code=400, content={"ok": False, "outputs": outputs})
+            
+    return {"ok": True, "outputs": outputs}
+
+
+@app.post("/api/github/webhook")
+async def github_webhook(req: FastAPIRequest):
+    data = await req.json()
+    commits = data.get("commits", [])
+    pusher = data.get("pusher", {}).get("name", "GitHub User")
+    branch = data.get("ref", "refs/heads/main").split("/")[-1]
+    
+    with db() as conn:
+        for c in commits:
+            msg = c.get("message", "webhook push commit")
+            conn.execute(
+                "insert into submissions(user_name,task_title,file_name,status,credits_awarded,submitted_at) values(?,?,?,?,?,?)",
+                (pusher, f"Webhook Push: {msg}", f"branch:{branch}", "Approved", 15, int(time.time()))
+            )
+            conn.execute(
+                "insert into credits(user_name,amount,reason,created_at) values(?,?,?,?)",
+                (pusher, 15, f"Webhook Push Reward: {msg}", int(time.time()))
+            )
+    return {"status": "acknowledged", "credits_awarded": len(commits)*15}
+
+
+@app.get("/api/state")
+async def get_state():
+    with db() as conn:
+        tasks = conn.execute("select tasks.*, users.name as assignee from tasks left join users on users.id=tasks.assignee_id order by updated_at desc").fetchall()
+        submissions = conn.execute("select * from submissions order by submitted_at desc").fetchall()
+        credits_list = conn.execute("select * from credits order by created_at desc").fetchall()
+        lb_rows = conn.execute("select user_name, sum(amount) as total from credits group by user_name order by total desc").fetchall()
+        phase_row = conn.execute("select phase from phase_events order by created_at desc limit 1").fetchone()
+        current_phase = phase_row["phase"] if phase_row else "Building"
+        team_rows = conn.execute("select users.name, users.role, statuses.state, statuses.message, statuses.updated_at from users left join statuses on statuses.user_id=users.id").fetchall()
+        
+    return {
+        "tasks": [rowdict(r) for r in tasks],
+        "submissions": [rowdict(r) for r in submissions],
+        "credits": [rowdict(r) for r in credits_list],
+        "leaderboard": [rowdict(r) for r in lb_rows],
+        "phase": current_phase,
+        "team": [rowdict(r) for r in team_rows]
+    }
+
+
+@app.post("/api/submissions")
+async def create_submission(req: FastAPIRequest):
+    data = await req.json()
+    user_name = data.get("user_name", "Developer")
+    task_title = data.get("task_title", "Feature Update")
+    file_name = data.get("file_name", "push_update")
+    status = data.get("status", "Pending")
+    credits_awarded = int(data.get("credits_awarded", 10))
+    
+    with db() as conn:
+        conn.execute(
+            "insert into submissions(user_name,task_title,file_name,status,credits_awarded,submitted_at) values(?,?,?,?,?,?)",
+            (user_name, task_title, file_name, status, credits_awarded, int(time.time()))
+        )
+        if credits_awarded > 0:
+            conn.execute(
+                "insert into credits(user_name,amount,reason,created_at) values(?,?,?,?)",
+                (user_name, credits_awarded, f"Submission: {task_title}", int(time.time()))
+            )
+    return {"ok": True}
+
+
+@app.post("/api/submissions/update")
+async def update_submission(req: FastAPIRequest):
+    data = await req.json()
+    sub_id = data.get("id")
+    status = data.get("status")
+    bonus = int(data.get("bonus", 0))
+    
+    with db() as conn:
+        if sub_id:
+            conn.execute("update submissions set status=? where id=?", (status, sub_id))
+            if bonus > 0:
+                sub = conn.execute("select user_name, task_title from submissions where id=?", (sub_id,)).fetchone()
+                if sub:
+                    conn.execute("update submissions set credits_awarded=credits_awarded+? where id=?", (bonus, sub_id))
                     conn.execute(
                         "insert into credits(user_name,amount,reason,created_at) values(?,?,?,?)",
-                        (user_name, amount, reason, int(time.time()))
+                        (sub["user_name"], bonus, f"Bonus for {sub['task_title']}", int(time.time()))
                     )
-                return self.json({"ok": True})
-            if method == "POST" and path == "/api/analyze":
-                return self.analyze()
-            if method == "POST" and path == "/api/brief":
-                return self.brief()
-            return self.json({"error": "not_found"}, 404)
-        except Exception as exc:
-            return self.json({"error": str(exc)}, 500)
+    return {"ok": True}
 
-    def analyze(self):
-        data = self.body()
-        transcript = data.get("transcript") or data.get("input") or ""
-        analysis_type = data.get("type", "meeting")
-        if analysis_type == "brief":
-            return self.brief(data.get("state") or data.get("data") or {})
-        if analysis_type == "task":
-            return self.task_description(data.get("input", ""))
-        if not transcript:
-            return self.json({"error": "No transcript provided"}, 400)
-        prompt = f"""Analyze this meeting transcript and return ONLY valid JSON, no markdown, no explanation.
 
+@app.post("/api/credits/award")
+async def award_credits(req: FastAPIRequest):
+    data = await req.json()
+    user_name = data.get("user_name")
+    amount = int(data.get("amount", 10))
+    reason = data.get("reason", "Manager Award")
+    
+    with db() as conn:
+        conn.execute(
+            "insert into credits(user_name,amount,reason,created_at) values(?,?,?,?)",
+            (user_name, amount, reason, int(time.time()))
+        )
+    return {"ok": True}
+
+
+async def generate_brief_endpoint(project_data):
+    prompt = f"""Generate a 5-bullet executive project brief from this data.
+Return ONLY a JSON array of 5 strings, no markdown.
+
+Data: {json.dumps(project_data)}"""
+    try:
+        raw_ai = gemini_message(prompt, response_json=True)
+        bullets = json.loads(raw_ai)
+        if not isinstance(bullets, list):
+            raise ValueError("brief was not a list")
+    except Exception:
+        bullets = [
+            "Atlas is on track for Friday client review if QA is unblocked today.",
+            "Payment retry handling and login redirect are the highest-risk work items.",
+            "Razorpay sandbox credentials are the main blocker for testing.",
+            "Cart and wishlist work show strong completion momentum.",
+            "Recommended action: keep UPI out of beta and focus card-payment stability.",
+        ]
+    html = "<ul>" + "".join(f"<li>{bullet}</li>" for bullet in bullets[:5]) + "</ul>"
+    return {"bullets": bullets[:5], "html": html}
+
+
+async def task_description_endpoint(title):
+    prompt = f"""Expand this rough software task into a useful task card.
+Return ONLY valid JSON with keys description, acceptance_criteria, complexity, suggested_assignee.
+Task: {title}"""
+    try:
+        raw_ai = gemini_message(prompt, response_json=True)
+        card = json.loads(raw_ai)
+    except Exception:
+        card = {
+            "description": f"Investigate and complete: {title}. Confirm expected behavior, root cause, implementation, and regression coverage.",
+            "acceptance_criteria": [
+                "The issue is reproduced and documented.",
+                "The fix works on desktop and mobile paths.",
+                "Regression tests or QA checklist items are added.",
+            ],
+            "complexity": "Medium",
+            "suggested_assignee": "Shreya",
+        }
+    criteria = "".join(f"<li>{item}</li>" for item in card.get("acceptance_criteria", []))
+    html = (
+        f"<b>Description:</b> {card.get('description', '')}<br><br>"
+        f"<b>Acceptance criteria:</b><ul>{criteria}</ul>"
+        f"<b>Complexity:</b> {card.get('complexity', 'Medium')}<br>"
+        f"<b>Suggested assignee:</b> {card.get('suggested_assignee', 'Shreya')}"
+    )
+    return {"card": card, "html": html}
+
+
+def meeting_payload(result):
+    commitments = result.get("commitments", [])
+    decisions = result.get("decisions", [])
+    blockers = result.get("blockers", [])
+    tasks = [
+        f"{item.get('owner', 'Owner TBD')}: {item.get('text', '')}" + (f" by {item.get('deadline')}" if item.get("deadline") else "")
+        for item in commitments
+    ]
+    decision_text = [item.get("text", "") for item in decisions]
+    blocker_text = [
+        f"{item.get('text', '')} - unblock owner: {item.get('unblock_owner', 'TBD')}"
+        for item in blockers
+    ]
+    standup = "Standup: " + "; ".join(tasks[:3] + decision_text[:2] + blocker_text[:1])
+    return {
+        **result,
+        "tasks": tasks,
+        "standup": standup,
+        "html": "<b>Standup Summary</b><br>" + standup,
+    }
+
+
+@app.post("/api/analyze")
+async def analyze(req: FastAPIRequest):
+    data = await req.json()
+    transcript = data.get("transcript") or data.get("input") or ""
+    analysis_type = data.get("type", "meeting")
+    
+    if analysis_type == "brief":
+        return await generate_brief_endpoint(data.get("state") or data.get("data") or {})
+    if analysis_type == "task":
+        return await task_description_endpoint(data.get("input", ""))
+        
+    if not transcript:
+        raise HTTPException(status_code=400, detail="No transcript provided")
+        
+    prompt = f"""Analyze this meeting transcript and return ONLY valid JSON, no markdown, no explanation.
+ 
 Schema:
 {{
   "commitments": [{{"text": "string", "owner": "string", "deadline": "string or null"}}],
@@ -428,110 +568,41 @@ Schema:
 
 Transcript:
 {transcript}"""
-        try:
-            result = json.loads(anthropic_message(prompt))
-        except Exception:
-            result = fallback_analysis(transcript)
-        return self.json(self.meeting_payload(result))
+    try:
+        raw_ai = gemini_message(prompt, response_json=True)
+        result = json.loads(raw_ai)
+    except Exception:
+        result = fallback_analysis(transcript)
+        
+    return meeting_payload(result)
 
-    def brief(self, project_data=None):
-        if project_data is None:
-            project_data = self.body().get("data", {})
-        prompt = f"""Generate a 5-bullet executive project brief from this data.
-Return ONLY a JSON array of 5 strings, no markdown.
 
-Data: {json.dumps(project_data)}"""
-        try:
-            bullets = json.loads(anthropic_message(prompt, max_tokens=500))
-            if not isinstance(bullets, list):
-                raise ValueError("brief was not a list")
-        except Exception:
-            bullets = [
-                "Atlas is on track for Friday client review if QA is unblocked today.",
-                "Payment retry handling and login redirect are the highest-risk work items.",
-                "Razorpay sandbox credentials are the main blocker for testing.",
-                "Cart and wishlist work show strong completion momentum.",
-                "Recommended action: keep UPI out of beta and focus card-payment stability.",
-            ]
-        html = "<ul>" + "".join(f"<li>{bullet}</li>" for bullet in bullets[:5]) + "</ul>"
-        return self.json({"bullets": bullets[:5], "html": html})
+@app.post("/api/brief")
+async def generate_brief_route(req: FastAPIRequest):
+    data = await req.json()
+    project_data = data.get("data", {})
+    return await generate_brief_endpoint(project_data)
 
-    def task_description(self, title):
-        prompt = f"""Expand this rough software task into a useful task card.
-Return ONLY valid JSON with keys description, acceptance_criteria, complexity, suggested_assignee.
-Task: {title}"""
-        try:
-            card = json.loads(anthropic_message(prompt, max_tokens=700))
-        except Exception:
-            card = {
-                "description": f"Investigate and complete: {title}. Confirm expected behavior, root cause, implementation, and regression coverage.",
-                "acceptance_criteria": [
-                    "The issue is reproduced and documented.",
-                    "The fix works on desktop and mobile paths.",
-                    "Regression tests or QA checklist items are added.",
-                ],
-                "complexity": "Medium",
-                "suggested_assignee": "Shreya",
-            }
-        criteria = "".join(f"<li>{item}</li>" for item in card.get("acceptance_criteria", []))
-        html = (
-            f"<b>Description:</b> {card.get('description', '')}<br><br>"
-            f"<b>Acceptance criteria:</b><ul>{criteria}</ul>"
-            f"<b>Complexity:</b> {card.get('complexity', 'Medium')}<br>"
-            f"<b>Suggested assignee:</b> {card.get('suggested_assignee', 'Shreya')}"
-        )
-        return self.json({"card": card, "html": html})
 
-    def meeting_payload(self, result):
-        commitments = result.get("commitments", [])
-        decisions = result.get("decisions", [])
-        blockers = result.get("blockers", [])
-        questions = result.get("open_questions", [])
-        tasks = [
-            f"{item.get('owner', 'Owner TBD')}: {item.get('text', '')}" + (f" by {item.get('deadline')}" if item.get("deadline") else "")
-            for item in commitments
-        ]
-        decision_text = [item.get("text", "") for item in decisions]
-        blocker_text = [
-            f"{item.get('text', '')} - unblock owner: {item.get('unblock_owner', 'TBD')}"
-            for item in blockers
-        ]
-        standup = "Standup: " + "; ".join(tasks[:3] + decision_text[:2] + blocker_text[:1])
-        return {
-            **result,
-            "tasks": tasks,
-            "standup": standup,
-            "html": "<b>Standup Summary</b><br>" + standup,
-        }
+@app.get("/")
+async def get_index():
+    return FileResponse(ROOT / "index.html")
 
-    def github_feed(self):
-        if not (GITHUB_TOKEN and GITHUB_OWNER and GITHUB_REPO):
-            return self.json({"events": [], "warning": "Set GITHUB_TOKEN, GITHUB_OWNER, and GITHUB_REPO in .env"})
-        url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/events"
-        try:
-            req = Request(url, headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"})
-            with urlopen(req, timeout=10) as response:
-                events = json.loads(response.read().decode())
-            return self.json({"events": events[:10]})
-        except Exception as exc:
-            return self.json({"events": [], "warning": f"Failed to fetch GitHub feed: {str(exc)}"})
 
-    def git_command(self, *commands):
-        user = self.require_user()
-        if not user or user["role"] not in ("manager", "developer"):
-            return self.json({"error": "forbidden"}, 403)
-        outputs = []
-        for command in commands:
-            proc = safe_git_run(command)
-            outputs.append({"command": command, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr})
-            if proc.returncode != 0 and command[1] != "commit":
-                return self.json({"ok": False, "outputs": outputs}, 400)
-        return self.json({"ok": True, "outputs": outputs})
+@app.get("/app.js")
+async def get_js():
+    return FileResponse(ROOT / "app.js")
+
+
+@app.get("/styles.css")
+async def get_css():
+    return FileResponse(ROOT / "styles.css")
 
 
 if __name__ == "__main__":
+    import uvicorn
     init_db()
     os.chdir(ROOT)
     port = int(os.environ.get("PORT", "8000"))
     print(f"CollabFlow backend running at http://127.0.0.1:{port}")
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    uvicorn.run(app, host="127.0.0.1", port=port)

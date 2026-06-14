@@ -4,10 +4,11 @@ version = "0.1.0"
 description = "Collabflow Backend"
 requires-python = ">=3.9"
 dependencies = [
-    "anthropic",
+    "fastapi",
+    "uvicorn",
     "python-dotenv",
     "requests"
 ]
 
 [tool.vercel]
-entrypoint = "backend.server:Handler"
+entrypoint = "backend.server:app"
